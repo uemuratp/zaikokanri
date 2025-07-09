@@ -1,12 +1,21 @@
 import streamlit as st
 import pandas as pd
 import gspread
+import os
+import json
 from datetime import datetime, date
+from google.oauth2.service_account import Credentials
 
 # Google認証とスプレッドシート設定
-creds_path = r"C:\Users\k_uemura\Desktop\zaikokanri\credentials.json"
+creds_json = os.getenv('GOOGLE_CREDENTIALS')  # Streamlit Cloud の環境変数から認証情報を取得
+if creds_json is None:
+    raise ValueError("GOOGLE_CREDENTIALS環境変数が設定されていません。")
+
+creds_info = json.loads(creds_json)  # JSON形式で環境変数を取得
+creds = Credentials.from_service_account_info(creds_info)
+gc = gspread.authorize(creds)  # gspreadに認証情報を渡して認証
+
 SPREADSHEET_NAME = "zaikokanri"
-gc = gspread.service_account(filename=creds_path)
 
 @st.cache_data(ttl=20)
 def load_sheet_data():
