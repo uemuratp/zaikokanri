@@ -6,15 +6,28 @@ import json
 from datetime import datetime, date
 from google.oauth2.service_account import Credentials
 
-# Google認証とスプレッドシート設定
-creds_json = os.getenv('GOOGLE_CREDENTIALS')  # Streamlit Cloud の環境変数から認証情報を取得
-if creds_json is None:
-    raise ValueError("GOOGLE_CREDENTIALS環境変数が設定されていません。")
+# --- 認証処理（Cloud or ローカル自動判定） ---
+creds_json = os.getenv('GOOGLE_CREDENTIALS')
 
-creds_info = json.loads(creds_json)  # JSON形式で環境変数を取得
-creds = Credentials.from_service_account_info(creds_info)
-gc = gspread.authorize(creds)  # gspreadに認証情報を渡して認証
+if creds_json:
+    st.success("GOOGLE_CREDENTIALS環境変数が設定されています。（Cloudモード）")
+    creds_info = json.loads(creds_json)
+else:
+    local_path = "C:/Users/k_uemura/Desktop/zaikokanri/toumei/credentials.json"
+    if os.path.exists(local_path):
+        st.warning("GOOGLE_CREDENTIALS環境変数が未設定です。ローカルの認証ファイルを使用します。")
+        with open(local_path, "r", encoding="utf-8") as f:
+            creds_info = json.load(f)
+    else:
+        st.error("認証情報が見つかりません。環境変数またはローカルファイルを確認してください。")
+        st.stop()
 
+SCOPES = [
+    'https://www.googleapis.com/auth/spreadsheets',
+    'https://www.googleapis.com/auth/drive'
+]
+creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
+gc = gspread.authorize(creds)
 SPREADSHEET_NAME = "zaikokanri"
 
 @st.cache_data(ttl=20)
@@ -210,7 +223,8 @@ def update_checkout_log_after_return(return_items):
     st.success("返却処理を完了しました！")
     st.rerun()
 
-# 初期化
+
+# --- セッション初期化 ---
 if 'page' not in st.session_state:
     st.session_state.page = 'home'
 if 'selected_item' not in st.session_state:
@@ -222,9 +236,11 @@ if 'expanded_items' not in st.session_state:
 if 'page_params' not in st.session_state:
     st.session_state.page_params = {}
 
+# --- データ読込・在庫再計算 ---
 items_df, checkout_df, list_df = load_sheet_data()
 items_df = calculate_remaining_stock(items_df, checkout_df)
 
+# --- ページルーティング ---
 page = st.session_state.page
 if page == 'home':
     show_home()
