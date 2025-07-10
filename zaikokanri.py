@@ -29,6 +29,7 @@ else:
         with open(local_path, "r", encoding="utf-8") as f:
             creds_info = json.load(f)
     else:
+        st.error("認証情報が見つかりません")
         st.stop()
 
 SCOPES = [
@@ -67,76 +68,83 @@ def go_to(page, **kwargs):
     st.session_state.page_params = kwargs
 
 def show_home():
-    st.title("\U0001F3E0 備品管理システム")
+    global items_df
+    st.title("🏠 備品管理システム")
 
+    # --- 検索フォーム ---
     with st.form("search_form"):
         keyword_input = st.text_input("🔍 在庫検索（品物名または詳細を入力、スペース区切り可）").strip()
         search_mode = st.radio("検索モードを選択", ["AND", "OR"], horizontal=True)
         submitted = st.form_submit_button("🔍 検索")
 
-    if submitted:
-        if keyword_input:
-            keywords = keyword_input.split()
-            keywords_hira = [get_yomi(k) for k in keywords]
+    matched_items = pd.DataFrame()
+    if submitted and keyword_input:
+        keywords = keyword_input.split()
+        keywords_hira = [get_yomi(k) for k in keywords]
 
-            matched_items = pd.DataFrame()
+        # --- 品物名検索（ひらがな・3文字以上） ---
+        items_df['読み仮名'] = items_df['品物名'].apply(get_yomi)
+        if any(len(k) >= 3 for k in keywords_hira):
+            targets = [k for k in keywords_hira if len(k) >= 3]
 
-            # --- 品物名検索（ひらがな・3文字以上） ---
-            items_df['読み仮名'] = items_df['品物名'].apply(get_yomi)
-            if any(len(k) >= 3 for k in keywords_hira):
-                targets = [k for k in keywords_hira if len(k) >= 3]
+            def name_match_func(yomi):
+                return all(k in yomi for k in targets) if search_mode == "AND" else any(k in yomi for k in targets)
 
-                def name_match_func(yomi):
-                    return all(k in yomi for k in targets) if search_mode == "AND" else any(k in yomi for k in targets)
+            name_match = items_df[items_df['読み仮名'].apply(name_match_func)]
+            matched_items = pd.concat([matched_items, name_match])
 
-                name_match = items_df[items_df['読み仮名'].apply(name_match_func)]
-                matched_items = pd.concat([matched_items, name_match])
+        # --- 詳細検索（2文字以上） ---
+        if any(len(k) >= 2 for k in keywords):
+            targets = [k for k in keywords if len(k) >= 2]
 
-            # --- 詳細検索（2文字以上） ---
-            if any(len(k) >= 2 for k in keywords):
-                targets = [k for k in keywords if len(k) >= 2]
+            def detail_match_func(detail):
+                detail = str(detail)
+                return all(k in detail for k in targets) if search_mode == "AND" else any(k in detail for k in targets)
 
-                def detail_match_func(detail):
-                    detail = str(detail)
-                    return all(k in detail for k in targets) if search_mode == "AND" else any(k in detail for k in targets)
+            detail_match = items_df[items_df['詳細'].apply(detail_match_func)]
+            matched_items = pd.concat([matched_items, detail_match])
 
-                detail_match = items_df[items_df['詳細'].apply(detail_match_func)]
-                matched_items = pd.concat([matched_items, detail_match])
+        # --- 重複削除 ---
+        matched_items = matched_items.drop_duplicates(subset=['品物ID'])
 
-            # --- 重複削除 ---
-            matched_items = matched_items.drop_duplicates(subset=['品物ID'])
+        # --- 検索結果をセッションに保存 ---
+        st.session_state.matched_items = matched_items
+        st.session_state.search_triggered = True
+        st.rerun()
 
-            if not matched_items.empty:
-                grouped = matched_items.groupby('品物名')['品物ID'].apply(list).reset_index()
-                st.subheader(f"\U0001F50E 検索結果（{len(grouped)}件）")
-                for _, row in grouped.iterrows():
-                    group_name = row['品物名']
-                    if st.button(f"{group_name}", key=f"search_btn_{group_name}"):
-                        st.session_state.selected_item = row['品物ID'][0]
-                        go_to("list_detail")
-                        st.rerun()
-            else:
-                st.info("一致する品物が見つかりませんでした。")
-        else:
-            st.warning("検索キーワードを入力してください。")
+    # --- 検索結果表示（別の rerun 後のブロック） ---
+    if st.session_state.get("search_triggered") and 'matched_items' in st.session_state:
+        matched_items = st.session_state.matched_items
+        if not matched_items.empty:
+            grouped = matched_items.groupby('品物名')['品物ID'].apply(list).reset_index()
+            st.subheader(f"🔎 検索結果（{len(grouped)}件）")
+            for _, row in grouped.iterrows():
+                group_name = row['品物名']
+                unique_id = str(row['品物ID'][0])
+                if st.button(f"{group_name}", key=f"search_btn_{group_name}_{unique_id}"):
+                    st.session_state.selected_item = unique_id
+                    st.session_state.search_triggered = False
+                    go_to("list_detail")
+                    st.rerun()
 
     # --- 横並びの操作ボタン ---
     col1, col2, col3 = st.columns(3)
 
     with col1:
-        if st.button("\U0001F4CB 在庫一覧"):
+        if st.button("📋 在庫一覧"):
             go_to("list")
             st.rerun()
 
     with col2:
-        if st.button("\U0001F69A 持ち出し中確認"):
+        if st.button("🚚 持ち出し中確認"):
             go_to("checkout_status")
             st.rerun()
 
     with col3:
-        if st.button("\U0001F6D2 カートを見る"):
+        if st.button("🛒 カートを見る"):
             go_to("cart")
             st.rerun()
+
 
 
 
@@ -246,55 +254,78 @@ def show_list():
         go_to("home")
         st.rerun()
 
-
 def show_list_detail():
-    st.title("\U0001F4E6 詳細ページ")
+    st.title("📦 詳細ページ")
+
     if 'expanded_items' not in st.session_state:
         st.session_state.expanded_items = set()
+
     selected_item_id = st.session_state.get('selected_item')
-    if selected_item_id is None:
+
+    if selected_item_id is None or selected_item_id == "":
         st.write("品物が選択されていません。")
-        if st.button("\U0001F519 ホームに戻る"):
+        if st.button("🔙 ホームに戻る"):
             go_to("home")
             st.rerun()
         return
+
+    selected_item_id = str(selected_item_id)
+    items_df['品物ID'] = items_df['品物ID'].astype(str)
+
+    if selected_item_id not in items_df['品物ID'].values:
+        st.error("❌ items_df に selected_item が存在しません")
+        if st.button("🔙 ホームに戻る"):
+            go_to("home")
+            st.rerun()
+        return
+
     item_row = items_df[items_df['品物ID'] == selected_item_id]
     if item_row.empty:
         st.write("品物が見つかりません。")
-        if st.button("\U0001F519 ホームに戻る"):
+        if st.button("🔙 ホームに戻る"):
             go_to("home")
             st.rerun()
         return
+
     group_name = item_row.iloc[0]['品物名']
     group_items = items_df[items_df['品物名'] == group_name]
+
     for _, item in group_items.iterrows():
         detail_info = item.get('詳細', str(item['品物ID']))
         item_key = f"item_{item['品物ID']}"
         btn_label = f"【{detail_info}】 元の在庫数: {item['元の在庫数']} / 持ち出し中: {item['持ち出し中の在庫数']} / 残り: {item['残りの在庫数']}"
+
         if st.button(btn_label, key=f"btn_{item_key}"):
             if item['品物ID'] in st.session_state.expanded_items:
                 st.session_state.expanded_items.remove(item['品物ID'])
             else:
                 st.session_state.expanded_items.add(item['品物ID'])
             st.rerun()
+
         if item['品物ID'] in st.session_state.expanded_items:
             max_qty = item['残りの在庫数']
             if max_qty <= 0:
                 st.write("在庫なし")
             else:
-                qty = st.number_input(f"数量を選択 ({detail_info})", min_value=1, max_value=max_qty, key=f"qty_{item['品物ID']}")
+                qty = st.number_input(
+                    f"数量を選択 ({detail_info})", min_value=1, max_value=max_qty, key=f"qty_{item['品物ID']}"
+                )
                 if st.button(f"カートに入れる ({detail_info})", key=f"add_cart_{item['品物ID']}"):
                     cart = st.session_state.get('cart', {})
                     cart[item['品物ID']] = cart.get(item['品物ID'], 0) + qty
                     st.session_state.cart = cart
                     st.success(f"{detail_info} をカートに {qty} 個追加しました。")
+
         st.markdown("---")
-    if st.button("\U0001F6D2 カートを見る"):
+
+    if st.button("🛒 カートを見る"):
         go_to("cart")
         st.rerun()
-    if st.button("\U0001F519 ホームに戻る"):
+    if st.button("🔙 ホームに戻る"):
         go_to("home")
         st.rerun()
+
+
 
 def show_checkout_status():
     st.title("\U0001F69A 持ち出し中のアイテム")
@@ -426,10 +457,21 @@ if 'expanded_items' not in st.session_state:
     st.session_state.expanded_items = set()
 if 'page_params' not in st.session_state:
     st.session_state.page_params = {}
+if 'search_triggered' not in st.session_state:
+    st.session_state.search_triggered = False
 
-# --- データ読込・在庫再計算 ---
-items_df, checkout_df, list_df = load_sheet_data()
-items_df = calculate_remaining_stock(items_df, checkout_df)
+# --- データ読込・在庫再計算（items_df が確実に定義されるように） ---
+if 'items_df' not in st.session_state:
+    items_df, checkout_df, list_df = load_sheet_data()
+    items_df = calculate_remaining_stock(items_df, checkout_df)
+    st.session_state.items_df = items_df
+    st.session_state.checkout_df = checkout_df
+    st.session_state.list_df = list_df
+else:
+    items_df = st.session_state.items_df
+    checkout_df = st.session_state.checkout_df
+    list_df = st.session_state.list_df
+
 
 # --- ページルーティング ---
 page = st.session_state.page
