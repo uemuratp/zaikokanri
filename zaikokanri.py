@@ -68,28 +68,78 @@ def go_to(page, **kwargs):
 
 def show_home():
     st.title("\U0001F3E0 備品管理システム")
-    keyword = st.text_input("\U0001F50D 在庫検索（品物名を入力）")
-    if keyword:
-        filtered = items_df[items_df['品物名'].str.contains(keyword, case=False, na=False)]
-        grouped = filtered.groupby('品物名')['品物ID'].apply(list).reset_index()
-        st.subheader(f"\U0001F50E 検索結果（{len(grouped)}件）")
-        for _, row in grouped.iterrows():
-            group_name = row['品物名']
-            if st.button(f"{group_name}", key=f"search_btn_{group_name}"):
-                st.session_state.selected_item = row['品物ID'][0]
-                go_to("list_detail")
-                st.rerun()
-    else:
-        st.write("検索ワードを入力してください。")
-    if st.button("\U0001F4CB 在庫一覧"):
-        go_to("list")
-        st.rerun()
-    if st.button("\U0001F69A 持ち出し中確認"):
-        go_to("checkout_status")
-        st.rerun()
-    if st.button("\U0001F6D2 カートを見る"):
-        go_to("cart")
-        st.rerun()
+
+    with st.form("search_form"):
+        keyword_input = st.text_input("🔍 在庫検索（品物名または詳細を入力、スペース区切り可）").strip()
+        search_mode = st.radio("検索モードを選択", ["AND", "OR"], horizontal=True)
+        submitted = st.form_submit_button("🔍 検索")
+
+    if submitted:
+        if keyword_input:
+            keywords = keyword_input.split()
+            keywords_hira = [get_yomi(k) for k in keywords]
+
+            matched_items = pd.DataFrame()
+
+            # --- 品物名検索（ひらがな・3文字以上） ---
+            items_df['読み仮名'] = items_df['品物名'].apply(get_yomi)
+            if any(len(k) >= 3 for k in keywords_hira):
+                targets = [k for k in keywords_hira if len(k) >= 3]
+
+                def name_match_func(yomi):
+                    return all(k in yomi for k in targets) if search_mode == "AND" else any(k in yomi for k in targets)
+
+                name_match = items_df[items_df['読み仮名'].apply(name_match_func)]
+                matched_items = pd.concat([matched_items, name_match])
+
+            # --- 詳細検索（2文字以上） ---
+            if any(len(k) >= 2 for k in keywords):
+                targets = [k for k in keywords if len(k) >= 2]
+
+                def detail_match_func(detail):
+                    detail = str(detail)
+                    return all(k in detail for k in targets) if search_mode == "AND" else any(k in detail for k in targets)
+
+                detail_match = items_df[items_df['詳細'].apply(detail_match_func)]
+                matched_items = pd.concat([matched_items, detail_match])
+
+            # --- 重複削除 ---
+            matched_items = matched_items.drop_duplicates(subset=['品物ID'])
+
+            if not matched_items.empty:
+                grouped = matched_items.groupby('品物名')['品物ID'].apply(list).reset_index()
+                st.subheader(f"\U0001F50E 検索結果（{len(grouped)}件）")
+                for _, row in grouped.iterrows():
+                    group_name = row['品物名']
+                    if st.button(f"{group_name}", key=f"search_btn_{group_name}"):
+                        st.session_state.selected_item = row['品物ID'][0]
+                        go_to("list_detail")
+                        st.rerun()
+            else:
+                st.info("一致する品物が見つかりませんでした。")
+        else:
+            st.warning("検索キーワードを入力してください。")
+
+    # --- 横並びの操作ボタン ---
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        if st.button("\U0001F4CB 在庫一覧"):
+            go_to("list")
+            st.rerun()
+
+    with col2:
+        if st.button("\U0001F69A 持ち出し中確認"):
+            go_to("checkout_status")
+            st.rerun()
+
+    with col3:
+        if st.button("\U0001F6D2 カートを見る"):
+            go_to("cart")
+            st.rerun()
+
+
+
 
 # --- 追加：持ち出しログ登録用関数 ---
 def add_checkout_log(cart, destination, borrower, start_date, end_date):
