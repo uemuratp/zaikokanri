@@ -1,12 +1,43 @@
 import streamlit as st
 import pandas as pd
 import gspread
+import os
+import json
+import unicodedata
+import pykakasi
 from datetime import datetime, date
+from google.oauth2.service_account import Credentials
 
-# Google認証とスプレッドシート設定
-creds_path = r"C:\Users\k_uemura\Desktop\zaikokanri\credentials.json"
+# --- ふりがな変換セットアップ ---
+kakasi = pykakasi.kakasi()
+kakasi.setMode("J", "H")
+kakasi.setMode("K", "H")
+kakasi.setMode("H", "H")
+converter = kakasi.getConverter()
+
+def get_yomi(text):
+    return converter.do(text)
+
+# --- 認証処理（Cloud or ローカル自動判定） ---
+creds_json = os.getenv('GOOGLE_CREDENTIALS')
+if creds_json:
+    creds_info = json.loads(creds_json)
+else:
+    local_path = "C:/Users/k_uemura/Desktop/zaikokanri/toumei/credentials.json"
+    if os.path.exists(local_path):
+        with open(local_path, "r", encoding="utf-8") as f:
+            creds_info = json.load(f)
+    else:
+        st.error("認証情報が見つかりません")
+        st.stop()
+
+SCOPES = [
+    'https://www.googleapis.com/auth/spreadsheets',
+    'https://www.googleapis.com/auth/drive'
+]
+creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
+gc = gspread.authorize(creds)
 SPREADSHEET_NAME = "zaikokanri"
-gc = gspread.service_account(filename=creds_path)
 
 @st.cache_data(ttl=20)
 def load_sheet_data():
@@ -35,70 +66,224 @@ def go_to(page, **kwargs):
     st.session_state.page = page
     st.session_state.page_params = kwargs
 
-def add_checkout_log(cart, destination, borrower, start_date, end_date):
-    worksheet = gc.open(SPREADSHEET_NAME).worksheet('CheckoutLog')
-    existing_data = worksheet.get_all_records()
-    max_log_id = max([int(row['ログID']) for row in existing_data], default=0)
+# ✅ 追加：定型カート機能
+
+def show_favorites():
+    st.title("⭐ いつものカート（現場別）")
+    favorites_df = st.session_state.list_df
+    if favorites_df.empty:
+        st.info("定型カートがまだ登録されていません。")
+        return
+    site_names = favorites_df['持ち出し先'].dropna().unique()
+    for site in site_names:
+        if st.button(site, key=f"site_{site}"):
+            st.session_state.selected_site = site
+            go_to("favorites_detail")
+            st.rerun()
+    st.markdown("---")
+    st.info("📌 過去の持ち出し先ごとに定型カートが確認できます")
+    if st.button("🔙 ホームに戻る", key="fav_home_btn"):
+        go_to("home")
+        st.rerun()
+
+def show_favorites_detail():
+    site = st.session_state.get("selected_site")
+    if not site:
+        st.error("持ち出し先が選択されていません")
+        return
+    st.title(f"⭐ {site} の定型カート")
+    df = st.session_state.list_df
+    site_df = df[df['持ち出し先'] == site]
+    grouped = site_df.groupby('メモ')['品物ID', '数量'].apply(lambda x: x.to_dict('records')).reset_index(name='items')
+    for _, row in grouped.iterrows():
+        memo = row['メモ']
+        if st.button(memo, key=f"fav_btn_{memo}"):
+            st.session_state.favorite_cart = row['items']
+            st.session_state.favorite_site = site
+            st.session_state.favorite_memo = memo
+            go_to("favorite_use")
+            st.rerun()
+
+def show_favorite_use():
+    st.title(f"📦 {st.session_state.favorite_site} - {st.session_state.favorite_memo}")
+    items = st.session_state.favorite_cart
+    cart_preview = {}
+    for entry in items:
+        item_id = str(entry['品物ID'])
+        qty = int(entry['数量'])
+        item_row = st.session_state.items_df[st.session_state.items_df['品物ID'] == item_id]
+        if not item_row.empty:
+            item = item_row.iloc[0]
+            name = item['品物名']
+            detail = item['詳細']
+            st.write(f"✅ {name}（{detail}）: {qty}個")
+            cart_preview[item_id] = qty
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("🚚 この内容で持ち出す"):
+            st.session_state.cart = cart_preview.copy()
+            go_to("cart")
+            st.rerun()
+    with col2:
+        if st.button("🛠 編集する"):
+            st.session_state.cart = cart_preview.copy()
+            go_to("cart")
+            st.rerun()
+    if st.button("🔙 いつものページへ戻る"):
+        go_to("favorites")
+        st.rerun()
+
+def register_favorite(site, user, memo, cart):
+    new_entries = []
     for item_id, qty in cart.items():
-        item = items_df[items_df['品物ID'] == item_id].iloc[0]
-        max_log_id += 1
-        new_row = [
-            max_log_id,
-            item_id,
-            item['品物名'],
-            qty,
-            destination,
-            borrower,
-            start_date.strftime('%Y-%m-%d'),
-            end_date.strftime('%Y-%m-%d'),
-            'FALSE',
-            0
-        ]
-        worksheet.append_row(new_row)
-    st.success("持ち出しを登録しました！")
-    st.session_state.cart = {}
-    st.rerun()
+        new_entries.append({
+            '持ち出し先': site,
+            '持ち出し者': user,
+            'メモ': memo,
+            '品物ID': item_id,
+            '数量': qty
+        })
+    df = pd.DataFrame(new_entries)
+    list_df = st.session_state.list_df
+    if not df.empty and not df.merge(list_df, how='inner').equals(df):
+        spreadsheet = gc.open(SPREADSHEET_NAME)
+        ws = spreadsheet.worksheet("List")
+        ws.append_rows(df.values.tolist())
+        st.success("登録しました")
+    else:
+        st.info("✅ すでに同じ内容で登録されています")
 
 def show_home():
+    global items_df
     st.title("🏠 備品管理システム")
-    keyword = st.text_input("🔍 在庫検索（品物名を入力）", key="home_search_input")
-    if keyword:
-        filtered = items_df[items_df['品物名'].str.contains(keyword, case=False, na=False)]
-        grouped = filtered.groupby('品物名')['品物ID'].apply(list).reset_index()
-        st.subheader(f"🔎 検索結果（{len(grouped)}件）")
-        for _, row in grouped.iterrows():
-            group_name = row['品物名']
-            if st.button(f"{group_name}", key=f"home_search_btn_{group_name}"):
-                st.session_state.selected_item = row['品物ID'][0]
-                go_to("list_detail", prev_page="home")
-                st.rerun()
-    else:
-        st.write("検索ワードを入力してください。")
 
-    if st.button("📋 在庫一覧", key="home_zaiko_button"):
-        go_to("list", prev_page="home")
-        st.rerun()
-    if st.button("🚚 持ち出し中確認", key="home_checkout_button"):
-        go_to("checkout_status", prev_page="home")
-        st.rerun()
-    if st.button("🛒 カートを見る", key="home_cart_button"):
-        go_to("cart", prev_page="home")
+    # --- 検索フォーム ---
+    with st.form("search_form"):
+        keyword_input = st.text_input("🔍 在庫検索（品物名または詳細を入力、スペース区切り可）").strip()
+        search_mode = st.radio("検索モードを選択", ["AND", "OR"], horizontal=True)
+        submitted = st.form_submit_button("🔍 検索")
+
+    matched_items = pd.DataFrame()
+    if submitted and keyword_input:
+        keywords = keyword_input.split()
+        keywords_hira = [get_yomi(k) for k in keywords]
+
+        # --- 品物名検索（ひらがな・3文字以上） ---
+        items_df['読み仮名'] = items_df['品物名'].apply(get_yomi)
+        if any(len(k) >= 3 for k in keywords_hira):
+            targets = [k for k in keywords_hira if len(k) >= 3]
+
+            def name_match_func(yomi):
+                return all(k in yomi for k in targets) if search_mode == "AND" else any(k in yomi for k in targets)
+
+            name_match = items_df[items_df['読み仮名'].apply(name_match_func)]
+            matched_items = pd.concat([matched_items, name_match])
+
+        # --- 詳細検索（2文字以上） ---
+        if any(len(k) >= 2 for k in keywords):
+            targets = [k for k in keywords if len(k) >= 2]
+
+            def detail_match_func(detail):
+                detail = str(detail)
+                return all(k in detail for k in targets) if search_mode == "AND" else any(k in detail for k in targets)
+
+            detail_match = items_df[items_df['詳細'].apply(detail_match_func)]
+            matched_items = pd.concat([matched_items, detail_match])
+
+        # --- 重複削除 ---
+        matched_items = matched_items.drop_duplicates(subset=['品物ID'])
+
+        # --- 検索結果をセッションに保存 ---
+        st.session_state.matched_items = matched_items
+        st.session_state.search_triggered = True
         st.rerun()
 
+    # --- 検索結果表示（別の rerun 後のブロック） ---
+    if st.session_state.get("search_triggered") and 'matched_items' in st.session_state:
+        matched_items = st.session_state.matched_items
+        if not matched_items.empty:
+            grouped = matched_items.groupby('品物名')['品物ID'].apply(list).reset_index()
+            st.subheader(f"🔎 検索結果（{len(grouped)}件）")
+            for _, row in grouped.iterrows():
+                group_name = row['品物名']
+                unique_id = str(row['品物ID'][0])
+                if st.button(f"{group_name}", key=f"search_btn_{group_name}_{unique_id}"):
+                    st.session_state.selected_item = unique_id
+                    st.session_state.search_triggered = False
+                    go_to("list_detail")
+                    st.rerun()
+
+    # --- 横並びの操作ボタン ---
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        if st.button("📋 在庫一覧"):
+            go_to("list")
+            st.rerun()
+
+    with col2:
+        if st.button("🚚 持ち出し中確認"):
+            go_to("checkout_status")
+            st.rerun()
+
+    with col3:
+        if st.button("🛒 カートを見る"):
+            go_to("cart")
+            st.rerun()
+
+
+
+
+
+# --- 追加：持ち出しログ登録用関数 ---
+def add_checkout_log(cart, destination, borrower, start_date, end_date):
+    spreadsheet = gc.open(SPREADSHEET_NAME)
+    log_ws = spreadsheet.worksheet("CheckoutLog")
+
+    existing = log_ws.get_all_records()
+    next_id = len(existing) + 1
+
+    new_rows = []
+    for item_id, qty in cart.items():
+        item_row = items_df[items_df['品物ID'] == item_id].iloc[0]
+        item_name = item_row['品物名']
+        new_rows.append([
+            next_id, item_id, item_name, qty, destination, borrower,
+            start_date.strftime('%Y-%m-%d'),
+            end_date.strftime('%Y-%m-%d'),
+            "FALSE"
+        ])
+        next_id += 1
+
+    log_ws.append_rows(new_rows)
+    st.session_state.cart = {}  # カートを空にする
+    st.success("持ち出し処理が完了しました。")
+    st.rerun()
+
+# --- 修正済 show_cart 関数 ---
 def show_cart():
     st.title("🛒 カート内の品物一覧")
     cart = st.session_state.get('cart', {})
+
     if not cart:
         st.write("カートには何も入っていません。")
     else:
         to_remove = []
+
+        # 品物ごとの表示と数量変更
         for item_id, qty in cart.items():
             item = items_df[items_df['品物ID'] == item_id]
             if not item.empty:
                 item_name = item.iloc[0]['品物名']
                 detail = item.iloc[0].get('詳細', '')
                 max_qty = item.iloc[0]['残りの在庫数'] + qty
-                new_qty = st.number_input(f"{item_name}（詳細: {detail}）", min_value=0, max_value=max_qty, value=qty, step=1, key=f"cart_qty_{item_id}")
+
+                new_qty = st.number_input(
+                    f"{item_name}（詳細: {detail}）",
+                    min_value=0, max_value=max_qty, value=qty, step=1,
+                    key=f"cart_qty_{item_id}"
+                )
+
                 if new_qty != qty:
                     if new_qty == 0:
                         to_remove.append(item_id)
@@ -108,13 +293,18 @@ def show_cart():
                     st.rerun()
             else:
                 st.write(f"品物ID {item_id} は在庫リストに存在しません。")
+
         for rem_id in to_remove:
             cart.pop(rem_id, None)
+
         st.session_state.cart = cart
 
+        # 持ち出し情報入力セクション
         st.markdown("### 🚚 持ち出し情報を入力")
+
         destination_list = list_df['持ち出し先'].dropna().unique().tolist()
         borrower_list = list_df['持ち出し者'].dropna().unique().tolist()
+
         destination = st.selectbox("持ち出し先を選択", destination_list, key="cart_destination_select")
         borrower = st.selectbox("持ち出し者を選択", borrower_list, key="cart_borrower_select")
         start_date = st.date_input("持ち出し開始日", date.today(), key="cart_start_date")
@@ -127,21 +317,104 @@ def show_cart():
         go_to("home")
         st.rerun()
 
-def update_checkout_log_after_return(return_items):
-    worksheet = gc.open(SPREADSHEET_NAME).worksheet('CheckoutLog')
-    for log_id, qty in return_items.items():
-        checkout_log = checkout_df[checkout_df['ログID'] == log_id]
-        if not checkout_log.empty:
-            idx = checkout_log.index[0]
-            checkout_df.at[idx, '返却済み（TRUE/FALSE）'] = 'TRUE'
-            checkout_df.at[idx, '返却数量'] = qty
-            worksheet.update_cell(idx + 2, checkout_log.columns.get_loc('返却済み（TRUE/FALSE）') + 1, 'TRUE')
-            worksheet.update_cell(idx + 2, checkout_log.columns.get_loc('返却数量') + 1, qty)
-    st.success("返却処理を完了しました！")
-    st.rerun()
+
+def show_list():
+    st.title("\U0001F4CB 在庫一覧")
+
+    grouped = items_df.groupby('品物名')['品物ID'].apply(list).reset_index()
+    grouped['読み'] = grouped['品物名'].apply(get_yomi)
+    grouped = grouped.sort_values('読み').reset_index(drop=True)  # ← index を 0 始まりにリセット
+
+    for i in range(0, len(grouped), 4):
+        cols = st.columns(4)
+        for j in range(4):
+            if i + j < len(grouped):
+                row = grouped.iloc[i + j]
+                with cols[j]:
+                    if st.button(row['品物名'], key=f"list_btn_{row['品物名']}"):
+                        st.session_state.selected_item = row['品物ID'][0]
+                        go_to("list_detail")
+                        st.rerun()
+
+    if st.button("\U0001F519 ホームに戻る"):
+        go_to("home")
+        st.rerun()
+
+def show_list_detail():
+    st.title("📦 詳細ページ")
+
+    if 'expanded_items' not in st.session_state:
+        st.session_state.expanded_items = set()
+
+    selected_item_id = st.session_state.get('selected_item')
+
+    if selected_item_id is None or selected_item_id == "":
+        st.write("品物が選択されていません。")
+        if st.button("🔙 ホームに戻る"):
+            go_to("home")
+            st.rerun()
+        return
+
+    selected_item_id = str(selected_item_id)
+    items_df['品物ID'] = items_df['品物ID'].astype(str)
+
+    if selected_item_id not in items_df['品物ID'].values:
+        st.error("❌ items_df に selected_item が存在しません")
+        if st.button("🔙 ホームに戻る"):
+            go_to("home")
+            st.rerun()
+        return
+
+    item_row = items_df[items_df['品物ID'] == selected_item_id]
+    if item_row.empty:
+        st.write("品物が見つかりません。")
+        if st.button("🔙 ホームに戻る"):
+            go_to("home")
+            st.rerun()
+        return
+
+    group_name = item_row.iloc[0]['品物名']
+    group_items = items_df[items_df['品物名'] == group_name]
+
+    for _, item in group_items.iterrows():
+        detail_info = item.get('詳細', str(item['品物ID']))
+        item_key = f"item_{item['品物ID']}"
+        btn_label = f"【{detail_info}】 元の在庫数: {item['元の在庫数']} / 持ち出し中: {item['持ち出し中の在庫数']} / 残り: {item['残りの在庫数']}"
+
+        if st.button(btn_label, key=f"btn_{item_key}"):
+            if item['品物ID'] in st.session_state.expanded_items:
+                st.session_state.expanded_items.remove(item['品物ID'])
+            else:
+                st.session_state.expanded_items.add(item['品物ID'])
+            st.rerun()
+
+        if item['品物ID'] in st.session_state.expanded_items:
+            max_qty = item['残りの在庫数']
+            if max_qty <= 0:
+                st.write("在庫なし")
+            else:
+                qty = st.number_input(
+                    f"数量を選択 ({detail_info})", min_value=1, max_value=max_qty, key=f"qty_{item['品物ID']}"
+                )
+                if st.button(f"カートに入れる ({detail_info})", key=f"add_cart_{item['品物ID']}"):
+                    cart = st.session_state.get('cart', {})
+                    cart[item['品物ID']] = cart.get(item['品物ID'], 0) + qty
+                    st.session_state.cart = cart
+                    st.success(f"{detail_info} をカートに {qty} 個追加しました。")
+
+        st.markdown("---")
+
+    if st.button("🛒 カートを見る"):
+        go_to("cart")
+        st.rerun()
+    if st.button("🔙 ホームに戻る"):
+        go_to("home")
+        st.rerun()
+
+
 
 def show_checkout_status():
-    st.title("🚚 持ち出し中のアイテム")
+    st.title("\U0001F69A 持ち出し中のアイテム")
     active_checkout = checkout_df[checkout_df['返却済み（TRUE/FALSE）'].astype(str).str.upper() != 'TRUE']
     if active_checkout.empty:
         st.write("現在、持ち出し中のアイテムはありません。")
@@ -149,108 +422,117 @@ def show_checkout_status():
         groups = active_checkout.groupby(['持ち出し先', '持ち出し者'])
         for (destination, person), group in groups:
             btn_label = f"持ち出し先: {destination} / 持ち出し者: {person}"
-            if st.button(btn_label, key=f"checkout_btn_{destination}_{person}"):
+            if st.button(btn_label, key=f"btn_{destination}_{person}"):
                 go_to("return_detail", destination=destination, person=person)
                 st.rerun()
             st.write(f"開始日: {group['持ち出し開始日'].min()} / 終了日: {group['持ち出し終了日'].max()}")
             st.markdown("---")
-    if st.button("🔙 ホームに戻る", key="checkout_back_home_button"):
+    if st.button("\U0001F519 ホームに戻る"):
         go_to("home")
         st.rerun()
 
 def show_return_detail():
     destination = st.session_state.page_params.get('destination')
     person = st.session_state.page_params.get('person')
-    st.title(f"↩️ 返却処理（{destination} / {person}）")
+    st.title(f"\u21a9\ufe0f 返却処理（{destination} / {person}）")
+
     target = checkout_df[
         (checkout_df['持ち出し先'] == destination) &
         (checkout_df['持ち出し者'] == person) &
         (checkout_df['返却済み（TRUE/FALSE）'].astype(str).str.upper() != 'TRUE')
     ]
+
     if target.empty:
         st.write("返却待ちのアイテムはありません。")
     else:
         return_items = {}
+
         for _, row in target.iterrows():
+            log_id = row['ログID']
+            item_name = row['品物名']
+            item_info = items_df[items_df['品物ID'] == row['品物ID']]
+            detail = item_info.iloc[0]['詳細'] if not item_info.empty else ''
             default_qty = int(row['持ち出し数'])
-            checked = st.checkbox(f"{row['品物名']} | 数量: {default_qty}", key=f"return_checkbox_{row['ログID']}")
+
+            # --- 返却チェック ---
+            checked = st.checkbox(f"{item_name} | {detail} | 数量: {default_qty}", key=f"return_checkbox_{log_id}")
             if checked:
-                qty = st.number_input(f"返却数量（{row['品物名']}）", min_value=1, max_value=default_qty, value=default_qty, key=f"return_qty_{row['ログID']}")
-                return_items[row['ログID']] = qty
-        if st.button("返却する", key="return_confirm_button") and return_items:
+                qty = st.number_input(
+                    f"返却数量（{item_name}）", min_value=0, max_value=default_qty, value=default_qty,
+                    key=f"qty_{log_id}"
+                )
+
+                # --- 破損チェック ---
+                damaged = st.checkbox("破損したものがあるか", key=f"damaged_checkbox_{log_id}")
+                damaged_qty = 0
+                if damaged:
+                    damaged_qty = st.number_input(
+                        f"破損・滅失数量（{item_name}）", min_value=0, max_value=default_qty - qty,
+                        value=0, key=f"damaged_qty_{log_id}"
+                    )
+
+                # --- 登録用データ構築 ---
+                return_items[log_id] = {
+                    "返却数量": qty,
+                    "破損数量": damaged_qty,
+                    "品物ID": row['品物ID']
+                }
+
+        if st.button("✅ 選択したアイテムを返却") and return_items:
             update_checkout_log_after_return(return_items)
-    if st.button("🔙 ホームに戻る", key="return_back_home_button"):
+            return
+
+        if st.button("↩️ 全て選択して一括返却", key="return_all_button"):
+            for _, row in target.iterrows():
+                return_items[row['ログID']] = {
+                    "返却数量": int(row['持ち出し数']),
+                    "破損数量": 0,
+                    "品物ID": row['品物ID']
+                }
+            update_checkout_log_after_return(return_items)
+            return
+
+    if st.button("\U0001F519 ホームに戻る"):
         go_to("home")
         st.rerun()
 
-def show_list():
-    st.title("📋 在庫一覧")
-    grouped = items_df.groupby('品物名')['品物ID'].apply(list).reset_index()
-    for _, row in grouped.iterrows():
-        group_name = row['品物名']
-        if st.button(group_name, key=f"list_btn_{group_name}"):
-            st.session_state.selected_item = row['品物ID'][0]
-            go_to("list_detail", prev_page="list")
-            st.rerun()
-    if st.button("🔙 ホームに戻る", key="list_back_home_button"):
-        go_to("home")
-        st.rerun()
 
-def show_list_detail():
-    st.title("📦 詳細ページ")
-    if 'expanded_items' not in st.session_state:
-        st.session_state.expanded_items = set()
-    selected_item_id = st.session_state.get('selected_item')
-    if selected_item_id is None:
-        st.write("品物が選択されていません。")
-        if st.button("🔙 ホームに戻る", key="list_detail_back_home_button"):
-            go_to("home")
-            st.rerun()
-        return
-    item_row = items_df[items_df['品物ID'] == selected_item_id]
-    if item_row.empty:
-        st.write("品物が見つかりません。")
-        if st.button("🔙 ホームに戻る", key="list_detail_back_home_button_2"):
-            go_to("home")
-            st.rerun()
-        return
 
-    prev_page = st.session_state.page_params.get('prev_page', 'home')
+def update_checkout_log_after_return(return_items):
+    spreadsheet = gc.open(SPREADSHEET_NAME)
+    items_ws = spreadsheet.worksheet("Items")
+    checkout_ws = spreadsheet.worksheet("CheckoutLog")
 
-    group_name = item_row.iloc[0]['品物名']
-    group_items = items_df[items_df['品物名'] == group_name]
-    for _, item in group_items.iterrows():
-        detail_info = item.get('詳細', str(item['品物ID']))
-        item_key = f"item_{item['品物ID']}"
-        btn_label = f"【{detail_info}】 元の在庫数: {item['元の在庫数']} / 持ち出し中: {item['持ち出し中の在庫数']} / 残り: {item['残りの在庫数']}"
-        if st.button(btn_label, key=f"list_detail_btn_{item_key}"):
-            if item['品物ID'] in st.session_state.expanded_items:
-                st.session_state.expanded_items.remove(item['品物ID'])
-            else:
-                st.session_state.expanded_items.add(item['品物ID'])
-            st.rerun()
-        if item['品物ID'] in st.session_state.expanded_items:
-            max_qty = item['残りの在庫数']
-            if max_qty <= 0:
-                st.write("在庫なし")
-            else:
-                qty = st.number_input(f"数量を選択 ({detail_info})", min_value=1, max_value=max_qty, key=f"list_detail_qty_{item['品物ID']}")
-                if st.button(f"カートに入れる ({detail_info})", key=f"add_cart_{item['品物ID']}"):
-                    cart = st.session_state.get('cart', {})
-                    cart[item['品物ID']] = cart.get(item['品物ID'], 0) + qty
-                    st.session_state.cart = cart
-                    st.success(f"{detail_info} をカートに {qty} 個追加しました。")
-        st.markdown("---")
+    for log_id, data in return_items.items():
+        qty = data["返却数量"]
+        damaged_qty = data["破損数量"]
+        item_id = data["品物ID"]
 
-    if st.button("🔙 前のページに戻る", key="list_detail_back_button"):
-        go_to(prev_page)
-        st.rerun()
+        # --- CheckoutLogの更新 ---
+        checkout_log = checkout_df[checkout_df['ログID'] == log_id]
+        if not checkout_log.empty:
+            idx = checkout_log.index[0]
+            checkout_df.at[idx, '返却済み（TRUE/FALSE）'] = 'TRUE'
+            checkout_df.at[idx, '返却数量'] = qty
+            checkout_ws.update_cell(idx + 2, checkout_log.columns.get_loc('返却済み（TRUE/FALSE）') + 1, 'TRUE')
+            checkout_ws.update_cell(idx + 2, checkout_log.columns.get_loc('返却数量') + 1, qty)
 
-    if st.button("🛒 カートを見る", key="list_detail_cart_button"):
-        go_to("cart")
-        st.rerun()
+        # --- Itemsの元の在庫数を減らす（破損分）---
+        item_row = items_df[items_df['品物ID'] == item_id]
+        if not item_row.empty and damaged_qty > 0:
+            item_idx = item_row.index[0]
+            current_stock = int(items_df.at[item_idx, '元の在庫数'])
+            new_stock = max(0, current_stock - damaged_qty)
+            items_df.at[item_idx, '元の在庫数'] = new_stock
+            items_ws.update_cell(item_idx + 2, items_df.columns.get_loc('元の在庫数') + 1, new_stock)
 
-# 初期化
+    st.success("返却処理を完了しました！")
+    go_to("home")
+    st.rerun()
+
+
+
+# --- セッション初期化 ---
 if 'page' not in st.session_state:
     st.session_state.page = 'home'
 if 'selected_item' not in st.session_state:
@@ -261,10 +543,23 @@ if 'expanded_items' not in st.session_state:
     st.session_state.expanded_items = set()
 if 'page_params' not in st.session_state:
     st.session_state.page_params = {}
+if 'search_triggered' not in st.session_state:
+    st.session_state.search_triggered = False
 
-items_df, checkout_df, list_df = load_sheet_data()
-items_df = calculate_remaining_stock(items_df, checkout_df)
+# --- データ読込・在庫再計算（items_df が確実に定義されるように） ---
+if 'items_df' not in st.session_state:
+    items_df, checkout_df, list_df = load_sheet_data()
+    items_df = calculate_remaining_stock(items_df, checkout_df)
+    st.session_state.items_df = items_df
+    st.session_state.checkout_df = checkout_df
+    st.session_state.list_df = list_df
+else:
+    items_df = st.session_state.items_df
+    checkout_df = st.session_state.checkout_df
+    list_df = st.session_state.list_df
 
+
+# --- ページルーティング ---
 page = st.session_state.page
 if page == 'home':
     show_home()
@@ -280,4 +575,3 @@ elif page == 'return_detail':
     show_return_detail()
 else:
     st.error("無効なページ指定です。")
-
