@@ -98,25 +98,32 @@ def show_favorites_detail():
     if not site:
         st.error("持ち出し先が選択されていません")
         return
+
     st.title(f"⭐ {site} の定型カート")
-    df = st.session_state.favorite_df
+    df = st.session_state.favorite_df  # ✅ 読み込み済
     site_df = df[df['持ち出し先'] == site]
+
+    # メモ単位でグルーピング
     grouped = site_df.groupby('メモ')[['品物ID', '数量']].apply(lambda x: x.to_dict('records')).reset_index(name='items')
 
     for _, row in grouped.iterrows():
         memo = row['メモ']
-        if st.button(memo, key=f"fav_btn_{memo}"):
-            st.session_state.favorite_cart = row['items']
-            st.session_state.favorite_site = site
-            st.session_state.favorite_memo = memo
-            go_to("favorite_use")
-            st.rerun()
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            if st.button(memo, key=f"fav_btn_{memo}"):
+                st.session_state.favorite_cart = row['items']
+                st.session_state.favorite_site = site
+                st.session_state.favorite_memo = memo
+                go_to("favorite_use")
+                st.rerun()
+        
+
         st.markdown("---")
 
-    # ✅ ここがforの外である必要あり
     if st.button("🔙 ホームに戻る", key="fav_home_btn"):
         go_to("home")
         st.rerun()
+
 
 
 
@@ -125,6 +132,7 @@ def show_favorite_use():
     st.title(f"📦 {st.session_state.favorite_site} - {st.session_state.favorite_memo}")
     items = st.session_state.favorite_cart
     cart_preview = {}
+
     for entry in items:
         item_id = str(entry['品物ID'])
         qty = int(entry['数量'])
@@ -135,27 +143,55 @@ def show_favorite_use():
             detail = item['詳細']
             st.write(f"✅ {name}（{detail}）: {qty}個")
             cart_preview[item_id] = qty
-    col1, col2 = st.columns(2)
+
+    col1, col2, col3 = st.columns(3)
+
     with col1:
-        if st.button("🚚 この内容で持ち出す"):
+        if st.button("🚚 この内容をカートに入れる"):
             st.session_state.cart = cart_preview.copy()
             go_to("cart")
             st.rerun()
+
     with col2:
         if st.button("🛠 編集する"):
             st.session_state.cart = cart_preview.copy()
             go_to("cart")
             st.rerun()
-    
+
+    with col3:
+        if st.button("🗑 削除", key=f"delete_{st.session_state.favorite_memo}"):
+            site = st.session_state.favorite_site
+            memo = st.session_state.favorite_memo
+            df = st.session_state.favorite_df
+
+            # 対象行削除
+            new_df = df[~((df['持ち出し先'] == site) & (df['メモ'] == memo))].copy()
+
+            # データベース反映
+            spreadsheet = gc.open(SPREADSHEET_NAME)
+            ws = spreadsheet.worksheet("favorite")
+            ws.clear()
+            ws.append_row(new_df.columns.tolist())
+            if not new_df.empty:
+                ws.append_rows(new_df.values.tolist())
+
+            st.session_state.favorite_df = new_df
+            st.success(f"✅ 「{memo}」を削除しました")
+
+            # いつものページに戻る
+            go_to("favorites")
+            st.rerun()
+
     st.markdown("---")
+
     if st.button("🔙 いつものページへ戻る"):
         go_to("favorites")
         st.rerun()
 
-    # ✅ ここがforの外である必要あり
     if st.button("🔙 ホームに戻る", key="fav_home_btn"):
         go_to("home")
         st.rerun()
+
 
 
 
@@ -201,6 +237,8 @@ def register_favorite(site, memo, cart):
 
 
 
+
+import streamlit.components.v1 as components
 
 def show_home():
     st.title("🏠 備品管理システム")
@@ -389,17 +427,23 @@ def show_cart():
 
         if st.button("✅ 持ち出しを確定", key="cart_confirm_button"):
             add_checkout_log(cart, destination, borrower, start_date, end_date)
+    if st.button("🔙 ホームに戻る", key="cart_back_home_button2"):
+        go_to("home")
+        st.rerun()
+        
+        
+    st.markdown("---")
 
-        # ✅ いつものカート登録 UI（修正済：borrower 削除）
-        st.markdown("### ⭐ このカートを定型として保存")
-        memo_input = st.text_input("工事名を入力", key="memo_input")
-        if st.button("⭐ 新しく登録する", key="register_favorite_btn"):
-            if not memo_input.strip():
-                st.warning("工事名を入力してください。")
-            elif not cart:
-                st.warning("カートが空です。")
-            else:
-                register_favorite(destination, memo_input.strip(), cart)  # ✅ 修正済
+    # ✅ いつものカート登録 UI（修正済：borrower 削除）
+    st.markdown("### ⭐ このカートを定型として保存")
+    memo_input = st.text_input("工事名を入力", key="memo_input")
+    if st.button("⭐ 新しく登録する", key="register_favorite_btn"):
+        if not memo_input.strip():
+            st.warning("工事名を入力してください。")
+        elif not cart:
+            st.warning("カートが空です。")
+        else:
+            register_favorite(destination, memo_input.strip(), cart)  # ✅ 修正済
     if st.button("🔙 ホームに戻る", key="cart_back_home_button"):
         go_to("home")
         st.rerun()
@@ -424,6 +468,21 @@ def add_checkout_log(cart, destination, borrower, start_date, end_date):
     st.rerun()
 
 def show_checkout_status():
+    st.markdown("""
+    <style>
+    /* 日付入力のマージンを縮める */
+    .stDateInput {
+        margin-bottom: 0.1rem;
+    }
+
+    /* 区切り線（---）のマージンを縮める */
+    hr {
+        margin-top: 0.1rem;
+        margin-bottom: 0.1rem;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
     st.title("🚚 持ち出し中（現場単位）")
     active_checkout = checkout_df[checkout_df['返却済み（TRUE/FALSE）'].astype(str).str.upper() != 'TRUE']
     if active_checkout.empty:
@@ -441,14 +500,19 @@ def show_checkout_status():
         go_to("home")
         st.rerun()
 
+
+
 def show_return_detail():
     destination = st.session_state.page_params.get('destination')
     person = st.session_state.page_params.get('person')
     st.title(f"↩️ 返却処理（{destination} / {person}）")
+
     target = checkout_df[
         (checkout_df['持ち出し先'] == destination) &
         (checkout_df['持ち出し者'] == person) &
-        (checkout_df['返却済み（TRUE/FALSE）'].astype(str).str.upper() != 'TRUE')]
+        (checkout_df['返却済み（TRUE/FALSE）'].astype(str).str.upper() != 'TRUE')
+    ]
+
     if target.empty:
         st.write("返却待ちのアイテムはありません。")
     else:
@@ -459,17 +523,20 @@ def show_return_detail():
             item_info = items_df[items_df['品物ID'] == row['品物ID']]
             detail = item_info.iloc[0]['詳細'] if not item_info.empty else ''
             default_qty = int(row['持ち出し数'])
-            checked = st.checkbox(f"{item_name} | {detail} | 数量: {default_qty}", key=f"return_checkbox_{log_id}")
+            checked = st.checkbox(f"{item_name} / {detail} / 数量: {default_qty}", key=f"return_checkbox_{log_id}")
             if checked:
                 qty = st.number_input(f"返却数量（{item_name}）", min_value=0, max_value=default_qty, value=default_qty, key=f"qty_{log_id}")
                 damaged = st.checkbox("破損したものがあるか", key=f"damaged_checkbox_{log_id}")
                 damaged_qty = 0
                 if damaged:
+                    st.caption("※返却数量を設定後、破損数量を入力しないとダメです。（借りた数量＞返却数量≧破損数量。一部返却できるので借りた数量＝返却数量＋破損数量でなくてOK。）")
                     damaged_qty = st.number_input(f"破損・滅失数量（{item_name}）", min_value=0, max_value=default_qty - qty, value=0, key=f"damaged_qty_{log_id}")
                 return_items[log_id] = {"返却数量": qty, "破損数量": damaged_qty, "品物ID": row['品物ID']}
+
         if st.button("✅ 選択したアイテムを返却") and return_items:
             update_checkout_log_after_return(return_items)
             return
+
         if st.button("↩️ 全て選択して一括返却", key="return_all_button"):
             for _, row in target.iterrows():
                 return_items[row['ログID']] = {
@@ -479,9 +546,19 @@ def show_return_detail():
                 }
             update_checkout_log_after_return(return_items)
             return
+
     if st.button("🔙 ホームに戻る"):
         go_to("home")
         st.rerun()
+
+
+
+
+
+
+
+
+
 
 def update_checkout_log_after_return(return_items):
     spreadsheet = gc.open(SPREADSHEET_NAME)
